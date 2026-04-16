@@ -1,0 +1,69 @@
+import { NextRequest, NextResponse } from 'next/server'
+import { registerSchema } from '@/lib/validation/schemas'
+import { createServerSupabase, supabaseAdmin } from '@/lib/db/supabase'
+import { authRateLimit, getClientIP, sanitizeObject, auditLog } from '@/lib/security'
+import { sendWelcomeEmail } from '@/lib/email'
+
+export async function POST(req: NextRequest) {
+  const ip = getClientIP(req)
+
+  // Rate limit: 5 registrations per IP per 15 mins
+  const limit = authRateLimit(ip)
+  if (!limit.success) {
+    return NextResponse.json({ error: 'Too many registration attempts. Try again later.' }, { status: 429 })
+  }
+
+  try {
+    const body = await req.json()
+    const sanitized = sanitizeObject(body)
+    const parse = registerSchema.safeParse(sanitized)
+
+    if (!parse.success) {
+      return NextResponse.json({ error: 'Validation failed', details: parse.error.flatten() }, { status: 400 })
+    }
+
+    const { email, password, full_name, role } = parse.data
+
+    // Create Supabase auth user
+    const { data: authData, error: authError } = await supabaseAdmin.auth.admin.createUser({
+      email,
+      password,
+      user_metadata: { full_name, role },
+      email_confirm: true, // skip email confirmation in dev
+    })
+
+    if (authError) {
+      if (authError.message.includes('already registered')) {
+        return NextResponse.json({ error: 'An account with this email already exists.' }, { status: 409 })
+      }
+      return NextResponse.json({ error: authError.message }, { status: 400 })
+    }
+
+    // Update profile role (trigger creates the profile, we update role)
+    await supabaseAdmin.from('profiles').update({ role }).eq('id', authData.user.id)
+
+    // Sign in to get session
+    const supabase = createServerSupabase()
+    const { data: sessionData, error: signInError } = await supabase.auth.signInWithPassword({ email, password })
+
+    if (signInError) {
+      return NextResponse.json({ error: 'Account created but login failed. Please log in manually.' }, { status: 201 })
+    }
+
+    // Send welcome email (non-blocking)
+    sendWelcomeEmail(email, full_name).catch(console.error)
+
+    // Audit log
+    auditLog({ userId: authData.user.id, action: 'user.register', ipAddress: ip, metadata: { role } }).catch(console.error)
+
+    return NextResponse.json({
+      success: true,
+      user: { id: authData.user.id, email, full_name, role },
+      session: sessionData.session,
+    }, { status: 201 })
+
+  } catch (error) {
+    console.error('Register error:', error)
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
+  }
+}
